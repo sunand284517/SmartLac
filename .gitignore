@@ -1,0 +1,23 @@
+# Node.js
+node_modules/
+dist/
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+
+# Datasets & Models
+dataset/
+*.pth
+*.pt
+train_*.log
+
+# OS Files
+.DS_Store
+Thumbs.db
