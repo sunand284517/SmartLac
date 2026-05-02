@@ -5,6 +5,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
+import torchvision.models as models
 
 # Define 5 major productive stages
 CLASSES = [
@@ -18,44 +19,69 @@ CLASSES = [
 class CowSonogramCNN(nn.Module):
     def __init__(self, num_classes=5):
         super(CowSonogramCNN, self).__init__()
-        # Shared Convolutional Feature Extractor
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2)
-        )
         
-        # Shared Fully Connected Base
+        # Load pre-trained InceptionV3
+        # Note: InceptionV3 expects 299x299 input
+        self.backbone = models.inception_v3(weights=models.Inception_V3_Weights.DEFAULT)
+        
+        # We'll handle the heads ourselves, so replace the built-in FC
+        self.backbone.fc = nn.Identity()
+        self.backbone.aux_logits = False # Simplify to avoid secondary loss
+        
+        # Freeze early layers
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+            
+        # Unfreeze the top Inception blocks (Mixed_7b, Mixed_7c) for fine-tuning
+        for param in self.backbone.Mixed_7b.parameters():
+            param.requires_grad = True
+        for param in self.backbone.Mixed_7c.parameters():
+            param.requires_grad = True
+        
+        # InceptionV3 output before FC is 2048 channels
+        in_features = 2048 
+        
+        # Upgraded 2-layer head
         self.fc_layer = nn.Sequential(
-            nn.Linear(64 * 28 * 28, 512), 
+            nn.Linear(in_features, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.4)
         )
         
         # Multi-Task Learning Heads
-        self.classification_head = nn.Linear(512, num_classes)
-        self.regression_head = nn.Linear(512, 1)
-        
+        self.classification_head = nn.Linear(256, num_classes)
+        self.regression_head = nn.Linear(256, 1)
+
     def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1) # Flatten
-        shared_features = self.fc_layer(x)
+        # InceptionV3 forward returns a wrapper object if aux_logits is handled, 
+        # but since we set fc=Identity, it returns the 2048 features.
+        features = self.backbone(x)
         
-        class_logits = self.classification_head(shared_features)
-        yield_pred = self.regression_head(shared_features)
+        # Ensure we have [Batch, 2048]
+        if isinstance(features, torch.Tensor):
+            x = features
+        else:
+            x = features.logits
+            
+        x = self.fc_layer(x)
+        
+        class_logits = self.classification_head(x)
+        yield_pred = self.regression_head(x)
         
         return class_logits, yield_pred
+
+    @staticmethod
+    def get_inference_transform():
+        return transforms.Compose([
+            transforms.Resize((299, 299)), # InceptionV3 specific
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_PATH = os.path.join(BASE_DIR, 'cow_model.pth')
@@ -77,12 +103,19 @@ def get_model(model_path=DEFAULT_MODEL_PATH):
 def get_consistent_class(yield_val):
     if yield_val == 0:
         return 'Dry Period'
-    elif yield_val < 20:
+    elif yield_val <= 10:
+        # Peri-Partum: cows around calving, just beginning lactation
+        return 'Peri-Partum'
+    elif yield_val <= 20:
+        # Fresh Cows: recently calved, building up yield
         return 'Fresh Cows'
     elif yield_val >= 35:
+        # Peak Lactation: high producing cows
         return 'Peak Lactation'
     else:
+        # Late Lactation: 20-35 liters/day
         return 'Late Lactation'
+    
 
 def predict_image(image_path, model_path=DEFAULT_MODEL_PATH):
     """
