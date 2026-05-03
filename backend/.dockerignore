@@ -1,0 +1,8 @@
+node_modules
+uploads
+venv
+.env
+.elasticbeanstalk
+.DS_Store
+dump.rdb
+npm-debug.log
