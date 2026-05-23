@@ -49,8 +49,14 @@ npm run dev
 Open a new terminal window:
 ```bash
 cd ml_worker
+# Mac/Linux
 python3 -m venv venv
 source venv/bin/activate
+
+# Windows (PowerShell)
+py -m venv venv
+.\venv\Scripts\activate
+
 pip install -r requirements.txt
 celery -A worker.app worker --loglevel=info
 ```

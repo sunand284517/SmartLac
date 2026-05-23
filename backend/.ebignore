@@ -1,0 +1,10 @@
+node_modules/
+uploads/
+venv/
+.env
+.elasticbeanstalk/
+.dockerignore
+Dockerfile
+.DS_Store
+dump.rdb
+npm-debug.log

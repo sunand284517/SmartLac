@@ -17,40 +17,34 @@ CLASSES = [
 ]
 
 class CowSonogramCNN(nn.Module):
-    def __init__(self, num_classes=5):
+    def __init__(self, num_classes=5, pretrained=False):
         super(CowSonogramCNN, self).__init__()
         
-        # Load pre-trained InceptionV3
-        # Note: InceptionV3 expects 299x299 input
-        self.backbone = models.inception_v3(weights=models.Inception_V3_Weights.DEFAULT)
+        weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        try:
+            self.backbone = models.efficientnet_b0(weights=weights)
+        except Exception as exc:
+            if not pretrained:
+                raise
+            print(f"Could not load EfficientNet-B0 pretrained weights ({exc}). Using random initialization.")
+            self.backbone = models.efficientnet_b0(weights=None)
+        in_features = self.backbone.classifier[1].in_features
+        self.backbone.classifier = nn.Identity()
         
-        # We'll handle the heads ourselves, so replace the built-in FC
-        self.backbone.fc = nn.Identity()
-        self.backbone.aux_logits = False # Simplify to avoid secondary loss
-        
-        # Freeze early layers
+        # Unfreeze entire backbone for deep refinement of echotexture features
         for param in self.backbone.parameters():
-            param.requires_grad = False
-            
-        # Unfreeze the top Inception blocks (Mixed_7b, Mixed_7c) for fine-tuning
-        for param in self.backbone.Mixed_7b.parameters():
-            param.requires_grad = True
-        for param in self.backbone.Mixed_7c.parameters():
             param.requires_grad = True
         
-        # InceptionV3 output before FC is 2048 channels
-        in_features = 2048 
-        
-        # Upgraded 2-layer head
+        # Upgraded 2-layer head with maximum regularization
         self.fc_layer = nn.Sequential(
             nn.Linear(in_features, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(0.65), # Increased from 0.6
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.4)
+            nn.Dropout(0.55)  # Increased from 0.5
         )
         
         # Multi-Task Learning Heads
@@ -58,16 +52,7 @@ class CowSonogramCNN(nn.Module):
         self.regression_head = nn.Linear(256, 1)
 
     def forward(self, x):
-        # InceptionV3 forward returns a wrapper object if aux_logits is handled, 
-        # but since we set fc=Identity, it returns the 2048 features.
-        features = self.backbone(x)
-        
-        # Ensure we have [Batch, 2048]
-        if isinstance(features, torch.Tensor):
-            x = features
-        else:
-            x = features.logits
-            
+        x = self.backbone(x)
         x = self.fc_layer(x)
         
         class_logits = self.classification_head(x)
@@ -78,7 +63,7 @@ class CowSonogramCNN(nn.Module):
     @staticmethod
     def get_inference_transform():
         return transforms.Compose([
-            transforms.Resize((299, 299)), # InceptionV3 specific
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
@@ -94,7 +79,7 @@ def get_model(model_path=DEFAULT_MODEL_PATH):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found at {model_path}")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = CowSonogramCNN(num_classes=len(CLASSES)).to(device)
+        model = CowSonogramCNN(num_classes=len(CLASSES), pretrained=False).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         model.eval()
         _cached_model = (model, device)
@@ -124,12 +109,7 @@ def predict_image(image_path, model_path=DEFAULT_MODEL_PATH):
     try:
         model, device = get_model(model_path)
 
-        # Preprocess image
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        transform = CowSonogramCNN.get_inference_transform()
         
         image = Image.open(image_path).convert('RGB')
         tensor = transform(image).unsqueeze(0).to(device)

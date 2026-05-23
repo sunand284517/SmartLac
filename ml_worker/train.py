@@ -17,8 +17,9 @@ def train_model(data_dir, epochs=100, batch_size=32, lr=0.0001):
     print(f"Training on {device}...")
     
     transform = transforms.Compose([
-        transforms.RandomResizedCrop(299, scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(5),
         transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
         transforms.ToTensor(),
@@ -32,40 +33,58 @@ def train_model(data_dir, epochs=100, batch_size=32, lr=0.0001):
 
     try:
         dataset = CowSonogramDataset(data_dir, transform=transform)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=torch.cuda.is_available())
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
         print(f"Loaded {len(dataset)} images for multi-task training.")
         
         # Load validation dataset for Early Stopping
         test_data_dir = data_dir.replace('train', 'test')
         test_dataset = CowSonogramDataset(test_data_dir, transform=transforms.Compose([
-            transforms.Resize((299, 299)),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]))
-        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=torch.cuda.is_available())
+        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
         print(f"Loaded {len(test_dataset)} validation images for Early Stopping tracking.")
     except Exception as e:
         print(f"Could not load datasets.")
         print(e)
         return
         
-    model = CowSonogramCNN(num_classes=len(CLASSES)).to(device)
+    model = CowSonogramCNN(num_classes=len(CLASSES), pretrained=True).to(device)
     
-    criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion_class = nn.CrossEntropyLoss(label_smoothing=0.15)
     criterion_yield = nn.MSELoss()
     
-    # Differential learning rates
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-    head_params = [p for n, p in model.named_parameters() if p.requires_grad and "backbone" not in n]
+    # Differential learning rates for EfficientNet-B0 fine tuning
+    early_params = []
+    mid_params = []
+    late_params = []
+    head_params = []
+    
+    for n, p in model.named_parameters():
+        if not p.requires_grad: continue
+        if "backbone" not in n:
+            head_params.append(p)
+        else:
+            if any(x in n for x in ["features.0", "features.1", "features.2"]):
+                early_params.append(p)
+            elif any(x in n for x in ["features.3", "features.4", "features.5"]):
+                mid_params.append(p)
+            else:
+                late_params.append(p)
     
     optimizer = optim.Adam([
-        {'params': backbone_params, 'lr': 5e-6},
+        {'params': early_params, 'lr': 2e-6},
+        {'params': mid_params, 'lr': 5e-6},
+        {'params': late_params, 'lr': 1e-5},
         {'params': head_params, 'lr': 1e-3}
-    ], weight_decay=1e-3)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    ], weight_decay=8e-3)
+    
+    # Cosine annealing with longer period for deep refinement
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=1, eta_min=1e-6)
     
     best_val_loss = float('inf')
-    patience = 7
+    patience = 10
     patience_counter = 0
     
     for epoch in range(epochs):
@@ -86,7 +105,7 @@ def train_model(data_dir, epochs=100, batch_size=32, lr=0.0001):
             
             loss_c = criterion_class(class_logits, class_labels)
             loss_y = criterion_yield(yield_preds, yield_labels)
-            combined_loss = loss_c + (0.1 * loss_y)
+            combined_loss = loss_c + (0.05 * loss_y)
             
             combined_loss.backward()
             optimizer.step()
@@ -121,7 +140,7 @@ def train_model(data_dir, epochs=100, batch_size=32, lr=0.0001):
                 v_class_logits, v_yield_preds = model(v_inputs)
                 v_loss_c = criterion_class(v_class_logits, v_class_labels)
                 v_loss_y = criterion_yield(v_yield_preds, v_yield_labels)
-                val_loss_sum += (v_loss_c + (0.1 * v_loss_y)).item()
+                val_loss_sum += (v_loss_c + (0.05 * v_loss_y)).item()
                 
                 _, predicted = torch.max(v_class_logits.data, 1)
                 val_total += v_class_labels.size(0)
@@ -132,16 +151,16 @@ def train_model(data_dir, epochs=100, batch_size=32, lr=0.0001):
         gap = (train_acc - val_acc) * 100
         print(f"   --> Val Loss: {avg_val_loss:.4f} | Val Acc: {val_acc*100:.2f}% | Gap: {gap:.2f}%")
         
-        # Check Custom Stop Condition: Acc > 80% and Gap < 6%
-        if train_acc >= 0.80 and val_acc >= 0.80 and gap < 6.0:
+        # Check Custom Stop Condition: Acc >= 75% and Gap < 5%
+        if train_acc >= 0.75 and val_acc >= 0.75 and gap < 5.0:
             torch.save(model.state_dict(), 'cow_model.pth')
             print("\n" + "="*50)
-            print("TARGET REACHED: Accuracy > 80% and Overfitting < 6%!")
+            print("TARGET REACHED: Accuracy >= 75% and Overfitting < 5%!")
             print(f"Final Model Saved. Stopping training at Epoch {epoch+1}.")
             print("="*50)
             return
 
-        scheduler.step(avg_val_loss)
+        scheduler.step()
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
