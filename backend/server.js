@@ -24,9 +24,16 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/inference', require('./routes/inference'));
 
 // Database connection
-mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/dairy-sonogram')
-.then(() => console.log('MongoDB connected'))
-.catch(err => console.error(`❌ MongoDB connection failed: ${err.message}`));
+const connectWithRetry = () => {
+    mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/dairy-sonogram')
+    .then(() => console.log('MongoDB connected'))
+    .catch(err => {
+        console.error(`❌ MongoDB connection failed: ${err.message}. Retrying in 5 seconds...`);
+        setTimeout(connectWithRetry, 5000);
+    });
+};
+
+connectWithRetry();
 
 // Basic route
 app.get('/api/health', (req, res) => {
